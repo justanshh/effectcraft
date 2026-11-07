@@ -1295,7 +1295,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Effect Plug-in...",
             [],
             None,
-            "{path (.wasm / .wat plug-in, API v1) | folder (loads every .wasm in it)}",
+            "{path (.wasm / .wat plug-in, API v1 or v2) | folder (loads every .wasm in it)}",
             super::always,
             plugins_load
         ),

@@ -1,4 +1,4 @@
-//! The effect plug-in API, version [`PLUGIN_API_VERSION`].
+//! The effect plug-in API, versions [`MIN_PLUGIN_API_VERSION`] through [`PLUGIN_API_VERSION`].
 //!
 //! A plug-in is anything implementing [`EffectPlugin`]: a [`PluginManifest`] (stable id,
 //! display name, Effects & Presets category, typed parameters) and a `render` that processes a
@@ -21,6 +21,13 @@
 //!   pixel distances like blur radii by it);
 //! * rendering must be deterministic (same inputs, same output) and may run on several threads
 //!   at once.
+//!
+//! API 2 adds [`EffectPlugin::render_with_neighbours`]: the frames immediately around `time` on
+//! the layer's frame grid (`prev` / `next`), as [`PluginNeighbours`]. They come from the host's
+//! [`EffectHost::self_at`](crate::EffectHost::self_at), so they carry the same masks and the
+//! effects *below* the plug-in and remain a pure function of the project. A module opts in with
+//! `"api": 2` and exports `ec_render2`; API 1 modules keep loading unchanged and never see
+//! neighbours.
 
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -28,10 +35,18 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use serde::{Deserialize, Serialize};
 
-use crate::{Buf, EffectCtx, EffectSpec, ParamSpec, RenderFn};
+use crate::{Buf, EffectCtx, EffectSpec, Image, ParamSpec, RenderFn};
 
-/// The plug-in API version this build implements.
-pub const PLUGIN_API_VERSION: u32 = 1;
+/// The newest plug-in API version this build implements.
+pub const PLUGIN_API_VERSION: u32 = 2;
+
+/// The oldest plug-in API version this build still loads.
+pub const MIN_PLUGIN_API_VERSION: u32 = 1;
+
+/// Whether this build implements plug-in API version `v`.
+pub const fn supports_api(v: u32) -> bool {
+    v >= MIN_PLUGIN_API_VERSION && v <= PLUGIN_API_VERSION
+}
 
 /// The most plug-in effects one process can register.
 pub const MAX_PLUGINS: usize = 256;
@@ -117,7 +132,8 @@ pub struct PluginParam {
 /// What a plug-in declares about itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PluginManifest {
-    /// The plug-in API version it was written for (must be [`PLUGIN_API_VERSION`]).
+    /// The plug-in API version it was written for (supported: [`MIN_PLUGIN_API_VERSION`] through
+    /// [`PLUGIN_API_VERSION`]).
     pub api: u32,
     /// Stable, reverse-domain effect id (`org.example.posterize`); `ec.` is reserved.
     pub id: String,
@@ -138,8 +154,11 @@ impl PluginManifest {
     /// Check the manifest against this API version.
     pub fn validate(&self) -> Result<(), String> {
         const MAX_PARAMS: usize = 256;
-        if self.api != PLUGIN_API_VERSION {
-            return Err(format!("plug-in `{}` targets plug-in API {} but this build implements API {PLUGIN_API_VERSION}", self.id, self.api));
+        if !supports_api(self.api) {
+            return Err(format!(
+                "plug-in `{}` targets plug-in API {} but this build implements API {MIN_PLUGIN_API_VERSION}–{PLUGIN_API_VERSION}",
+                self.id, self.api
+            ));
         }
         let ok_id = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
         if !ok_id(&self.id) || self.id.starts_with("ec.") {
@@ -153,7 +172,7 @@ impl PluginManifest {
         }
         let mut seen = std::collections::HashSet::new();
         for p in &self.params {
-            if p.id.is_empty() || !p.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !seen.insert(p.id.as_str()) {
+            if !Self::valid_param_id(&p.id) || !seen.insert(p.id.as_str()) {
                 return Err(format!("plug-in `{}`: bad or duplicate parameter id `{}`", self.id, p.id));
             }
             if let PluginParamKind::Popup { options, default } = &p.kind
@@ -175,6 +194,13 @@ impl PluginManifest {
     pub fn flat_len(&self) -> usize {
         self.params.iter().map(|p| p.kind.width()).sum()
     }
+
+    /// A parameter id: `letters/digits/_`, or `/`-separated group path segments of those. The
+    /// host nests `borders/autoScale` into twirl-down groups (see
+    /// [`instantiate`](crate::instantiate)), so plug-ins can declare grouped UI with paths.
+    fn valid_param_id(id: &str) -> bool {
+        !id.is_empty() && !id.starts_with('/') && !id.ends_with('/') && id.split('/').all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    }
 }
 
 /// The pixels a plug-in renders, in place.
@@ -185,6 +211,29 @@ pub struct PluginFrame<'a> {
     pub pixels: &'a mut [[f32; 4]],
     /// Buffer pixels per layer pixel (preview resolution).
     pub scale: f64,
+}
+
+/// One neighbouring frame of a plug-in's own layer (plug-in API 2).
+#[derive(Clone, Copy)]
+pub struct PluginNeighbour<'a> {
+    /// Layer time of this frame, in seconds.
+    pub time: f64,
+    /// Premultiplied RGBA, row-major, on the same grid as the frame being rendered
+    /// (`width * height` pixels: same size, scale and padding).
+    pub pixels: &'a [[f32; 4]],
+}
+
+/// The frames immediately around the one a plug-in renders (plug-in API 2).
+///
+/// The host passes the layer's frames on its frame grid: at a frame boundary, the frame before
+/// and after it; between frames, the two frames that bracket `time`. A neighbour is `None` when
+/// the layer has no pixels there (the start or end of its source) or the host cannot provide
+/// one; a plug-in must degrade gracefully. API 1 modules implement
+/// [`EffectPlugin::render`] and never receive these.
+#[derive(Clone, Copy, Default)]
+pub struct PluginNeighbours<'a> {
+    pub prev: Option<PluginNeighbour<'a>>,
+    pub next: Option<PluginNeighbour<'a>>,
 }
 
 /// Parameter values for one render, flattened (see the module docs) with typed accessors.
@@ -227,6 +276,12 @@ pub trait EffectPlugin: Send + Sync {
     /// Process `frame` in place. `time` is layer time in seconds. An error leaves the frame as
     /// it was (the error is logged once).
     fn render(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64) -> Result<(), String>;
+    /// API 2: process `frame` in place with the frames around `time` available. The default
+    /// ignores them and calls [`EffectPlugin::render`], so API 1 plug-ins need no change.
+    fn render_with_neighbours(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64, neighbours: &PluginNeighbours<'_>) -> Result<(), String> {
+        let _ = neighbours;
+        self.render(frame, params, time)
+    }
     /// Where the plug-in came from (a file path, `built-in`…), for listings.
     fn source(&self) -> String {
         "built-in".into()
@@ -341,6 +396,37 @@ pub fn flatten(m: &PluginManifest, ctx: &EffectCtx, buf: &Buf) -> Vec<f64> {
     out
 }
 
+/// The layer times of the frames around `time` on a `fps` grid: the frame before and after it
+/// at a frame boundary, the two frames that bracket it between frames.
+fn neighbour_times(time: f64, fps: f64) -> (f64, f64) {
+    let step = 1.0 / fps;
+    let at = time * fps;
+    let before = at.floor();
+    let after = at.ceil();
+    if after - before < 1e-9 { (time - step, time + step) } else { (before / fps, after / fps) }
+}
+
+/// A neighbour resampled onto the current buffer's grid (same pixels, scale and padding).
+fn same_grid(nb: Buf, b: &Buf) -> Image {
+    if nb.img.width == b.img.width && nb.img.height == b.img.height && nb.offset == b.offset && nb.scale == b.scale {
+        return nb.img;
+    }
+    let k = nb.scale / b.scale.max(1e-9);
+    crate::util::gen_image(b.img.width, b.img.height, |x, y| {
+        let lx = (x as f64 + 0.5 - b.offset[0]) * k + nb.offset[0];
+        let ly = (y as f64 + 0.5 - b.offset[1]) * k + nb.offset[1];
+        nb.img.sample_bilinear(lx, ly)
+    })
+}
+
+/// The neighbours a plug-in may read (`None` without a host, or at the layer's ends).
+fn neighbour_images(ctx: &EffectCtx, buf: &Buf) -> (Option<(f64, Image)>, Option<(f64, Image)>) {
+    let Some(host) = ctx.env.host else { return (None, None) };
+    let (prev_time, next_time) = neighbour_times(ctx.time, ctx.fps());
+    let at = |t: f64| host.self_at(t, ctx.env.effect_index).map(|nb| (t, same_grid(nb, buf)));
+    (at(prev_time), at(next_time))
+}
+
 fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Buf {
     let Some(plugin) = SLOTS[slot].get() else { return buf };
     let m = plugin.manifest();
@@ -348,10 +434,129 @@ fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Buf {
     let params = PluginParams { manifest: m, flat: &flat };
     let (width, height) = (buf.img.width, buf.img.height);
     let before = buf.img.data.clone();
+    // API 2 plug-ins may read the frames around this one. Fetch them before borrowing the
+    // pixels mutably, and only for modules that asked for them.
+    let (prev, next) = if m.api >= 2 { neighbour_images(ctx, &buf) } else { (None, None) };
+    let neighbours = PluginNeighbours {
+        prev: prev.as_ref().map(|(time, img)| PluginNeighbour { time: *time, pixels: &img.data }),
+        next: next.as_ref().map(|(time, img)| PluginNeighbour { time: *time, pixels: &img.data }),
+    };
     let mut frame = PluginFrame { width, height, pixels: &mut buf.img.data, scale: buf.scale };
-    if let Err(e) = plugin.render(&mut frame, &params, ctx.time) {
+    if let Err(e) = plugin.render_with_neighbours(&mut frame, &params, ctx.time, &neighbours) {
         log::warn!("plug-in `{}`: {e}", m.id);
         buf.img.data = before;
     }
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use effectcraft_project::build::Ids;
+
+    use crate::{EffectEnv, EffectHost, Image, LayerPixels, flatten_params, instantiate};
+
+    struct Recorder {
+        m: PluginManifest,
+        seen: Mutex<Vec<[f64; 4]>>,
+    }
+
+    impl EffectPlugin for Recorder {
+        fn manifest(&self) -> &PluginManifest {
+            &self.m
+        }
+
+        fn render(&self, _frame: &mut PluginFrame, _params: &PluginParams, _time: f64) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn render_with_neighbours(&self, frame: &mut PluginFrame, _params: &PluginParams, _time: f64, neighbours: &PluginNeighbours<'_>) -> Result<(), String> {
+            let red = |n: Option<PluginNeighbour<'_>>| n.map_or(f64::NAN, |n| f64::from(n.pixels[0][0]));
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push([
+                    neighbours.prev.map_or(f64::NAN, |n| n.time),
+                    neighbours.next.map_or(f64::NAN, |n| n.time),
+                    red(neighbours.prev),
+                    red(neighbours.next),
+                ]);
+            }
+            frame.pixels[0] = [1.0, 2.0, 3.0, 4.0];
+            Ok(())
+        }
+    }
+
+    struct Neighbours;
+
+    impl EffectHost for Neighbours {
+        fn layer(&self, _id: u64, _masks_and_effects: bool) -> Option<LayerPixels> {
+            None
+        }
+
+        fn audio(&self, _id: u64, _start: f64, _frames: usize, _rate: u32) -> Option<Vec<f32>> {
+            None
+        }
+
+        fn self_at(&self, layer_time: f64, _effects: usize) -> Option<Buf> {
+            // The red channel carries the time, so a test can prove which frames arrived.
+            Some(Buf { img: Image::filled(2, 2, [layer_time as f32, 0.0, 0.0, 1.0]), offset: [0.0; 2], scale: 1.0 })
+        }
+    }
+
+    fn recorder(id: &str) -> (Arc<Recorder>, &'static EffectSpec) {
+        let m = PluginManifest {
+            api: 2,
+            id: id.into(),
+            name: "Recorder".into(),
+            category: "Test Plug-ins".into(),
+            version: "1".into(),
+            author: String::new(),
+            description: String::new(),
+            params: vec![],
+        };
+        let plugin = Arc::new(Recorder { m, seen: Mutex::new(vec![]) });
+        let spec = register_plugin(plugin.clone()).expect("a free plug-in slot");
+        (plugin, spec)
+    }
+
+    fn render_with_host(spec: &EffectSpec, time: f64, env: EffectEnv<'_>) -> Image {
+        let mut next = 1;
+        let g = instantiate(spec, &mut Ids(&mut next), spec.name, [2.0, 2.0]);
+        let params = flatten_params(&g, &mut |p| p.value.clone());
+        let ctx = EffectCtx { params: &params, time, layer_size: [2.0, 2.0], seed: 1, adjustment: false, env };
+        (spec.render)(&ctx, Buf { img: Image::filled(2, 2, [0.5; 4]), offset: [0.0; 2], scale: 1.0 }).img
+    }
+
+    #[test]
+    fn neighbour_times_bracket_the_layer_time() {
+        // On a frame: the frame before and after it.
+        assert_eq!(neighbour_times(0.5, 4.0), (0.25, 0.75));
+        // Between frames: the two frames it lies between.
+        let (prev, next) = neighbour_times(0.6, 4.0);
+        assert!((prev - 0.5).abs() < 1e-12 && (next - 0.75).abs() < 1e-12, "{prev} {next}");
+        // Floating-point land just below a frame boundary still brackets it.
+        let (prev, next) = neighbour_times(0.5 - 1e-12, 4.0);
+        assert!((prev - 0.25).abs() < 1e-12 && (next - 0.5).abs() < 1e-12, "{prev} {next}");
+    }
+
+    #[test]
+    fn api2_plugins_get_the_hosts_neighbour_frames() {
+        let (plugin, spec) = recorder("org.test.recorder.host");
+        let img = render_with_host(spec, 0.5, EffectEnv { host: Some(&Neighbours), frame_rate: 4.0, effect_index: 0, ..Default::default() });
+        assert_eq!(img.get(0, 0), [1.0, 2.0, 3.0, 4.0], "the plug-in rendered");
+        let seen = plugin.seen.lock().expect("not poisoned");
+        assert_eq!(seen.len(), 1);
+        // At 0.5 s and 4 fps the neighbours are 0.25 s and 0.75 s, and their pixels are theirs.
+        assert_eq!(seen[0], [0.25, 0.75, 0.25, 0.75]);
+    }
+
+    #[test]
+    fn api2_plugins_without_a_host_get_no_neighbours() {
+        let (plugin, spec) = recorder("org.test.recorder.nohost");
+        let img = render_with_host(spec, 0.5, EffectEnv { frame_rate: 4.0, ..Default::default() });
+        assert_eq!(img.get(0, 0), [1.0, 2.0, 3.0, 4.0], "the plug-in still rendered");
+        let seen = plugin.seen.lock().expect("not poisoned");
+        assert!(seen[0][0].is_nan() && seen[0][1].is_nan(), "{:?}", seen[0]);
+    }
 }

@@ -3,7 +3,7 @@
 use effectcraft_effects::{Buf, EffectCtx, EffectEnv, Image};
 use effectcraft_project::build::Ids;
 
-use crate::load_wasm;
+use crate::{PluginNeighbour, PluginNeighbours, load_wasm};
 
 fn load_err(r: Result<&'static effectcraft_effects::EffectSpec, String>) -> String {
     match r {
@@ -114,6 +114,88 @@ fn module_with(manifest: &str, render_body: &str) -> String {
     )
 }
 
+/// An API 2 module: `body` is `ec_render2`'s body, with `$px`, `$prev`, `$next`, `$flags`,
+/// `$prev_t` and `$next_t` in scope.
+fn module_v2(manifest: &str, body: &str) -> String {
+    let len = manifest.len();
+    let escaped = manifest.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"(module
+  (memory (export "memory") 2)
+  (data (i32.const 16) "{escaped}")
+  (func (export "ec_api_version") (result i32) i32.const 2)
+  (func (export "ec_manifest_ptr") (result i32) i32.const 16)
+  (func (export "ec_manifest_len") (result i32) i32.const {len})
+  (func (export "ec_alloc") (param $n i32) (result i32)
+    (local $need i32)
+    local.get $n
+    i32.const 131071
+    i32.add
+    i32.const 16
+    i32.shr_u
+    memory.size
+    i32.sub
+    local.tee $need
+    i32.const 0
+    i32.gt_s
+    if
+      local.get $need
+      memory.grow
+      drop
+    end
+    i32.const 65536)
+  (func (export "ec_render2")
+    (param $px i32) (param $w i32) (param $h i32) (param $params i32) (param $np i32)
+    (param $t f64) (param $scale f64)
+    (param $prev i32) (param $prev_t f64) (param $next i32) (param $next_t f64) (param $flags i32)
+    (result i32)
+    (local $i i32)
+    {body}
+    i32.const 0))"#
+    )
+}
+
+/// A v2 module that reports what it received: pixel 0 is `[prev_t, next_t, flags, 1]`, pixel 1
+/// is copied from the previous frame and pixel 2 from the next (only when their flag is set).
+fn neighbour_reporter_manifest(id: &str) -> String {
+    format!(r#"{{"api":2,"id":"{id}","name":"Neighbours","category":"Test Plug-ins","version":"1","params":[]}}"#)
+}
+
+fn neighbour_reporter_body() -> &'static str {
+    r#"local.get $px local.get $prev_t f32.demote_f64 f32.store
+    local.get $px local.get $next_t f32.demote_f64 f32.store offset=4
+    local.get $px local.get $flags f32.convert_i32_s f32.store offset=8
+    local.get $px f32.const 1 f32.store offset=12
+    local.get $flags i32.const 1 i32.and
+    if
+      i32.const 0 local.set $i
+      block $done_prev
+        loop $l_prev
+          local.get $i i32.const 16 i32.ge_u br_if $done_prev
+          local.get $px i32.const 16 i32.add local.get $i i32.add
+          local.get $prev i32.const 16 i32.add local.get $i i32.add f32.load
+          f32.store
+          local.get $i i32.const 4 i32.add local.set $i
+          br $l_prev
+        end
+      end
+    end
+    local.get $flags i32.const 2 i32.and
+    if
+      i32.const 0 local.set $i
+      block $done_next
+        loop $l_next
+          local.get $i i32.const 16 i32.ge_u br_if $done_next
+          local.get $px i32.const 32 i32.add local.get $i i32.add
+          local.get $next i32.const 32 i32.add local.get $i i32.add f32.load
+          f32.store
+          local.get $i i32.const 4 i32.add local.set $i
+          br $l_next
+        end
+      end
+    end"#
+}
+
 fn render(spec: &effectcraft_effects::EffectSpec, gain: f64, on: bool) -> Image {
     let mut next = 1;
     let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [4.0, 2.0]);
@@ -165,9 +247,11 @@ fn wasm_plugins_are_sandboxed() {
     assert!(load_err(load_wasm(imports.as_bytes(), "imports.wat")).contains("import"));
     // Garbage, wrong API version, bad manifests.
     assert!(load_wasm(b"\0asm nope", "bad.wasm").is_err());
+    // A module that claims API 2 must export `ec_render2`; a v1 module cannot just relabel.
     let v2 = gain_module("org.test.v2", "")
         .replace("(func (export \"ec_api_version\") (result i32) i32.const 1)", "(func (export \"ec_api_version\") (result i32) i32.const 2)");
-    assert!(load_err(load_wasm(v2.as_bytes(), "v2.wat")).contains("API 2"));
+    let e = load_err(load_wasm(v2.as_bytes(), "v2.wat"));
+    assert!(e.contains("ec_render2"), "{e}");
     let reserved = gain_module("ec.blur.mine", "");
     assert!(load_err(load_wasm(reserved.as_bytes(), "reserved.wat")).contains("reserved"));
 }
@@ -295,6 +379,57 @@ fn render_failures_leave_the_frame_and_recover() {
     for _ in 0..3 {
         assert_eq!(render(spin, 0.5, false).get(0, 0), orig);
     }
+}
+
+#[test]
+fn api_v2_receives_neighbour_frames_and_times() {
+    let spec = load_wasm(module_v2(&neighbour_reporter_manifest("org.test.nb.one"), neighbour_reporter_body()).as_bytes(), "neighbours.wat").unwrap();
+    assert_eq!(spec.id, "org.test.nb.one");
+    let plugin = effectcraft_effects::plugin::plugin("org.test.nb.one").unwrap();
+    let params = effectcraft_effects::plugin::PluginParams { manifest: plugin.manifest(), flat: &[] };
+    let current = vec![[0.9, 0.8, 0.7, 1.0]; 4];
+    let prev = vec![[0.11, 0.12, 0.13, 1.0], [0.21, 0.22, 0.23, 1.0], [0.31, 0.32, 0.33, 1.0], [0.41, 0.42, 0.43, 1.0]];
+    let next = vec![[0.51, 0.52, 0.53, 1.0], [0.61, 0.62, 0.63, 1.0], [0.71, 0.72, 0.73, 1.0], [0.81, 0.82, 0.83, 1.0]];
+    let neighbours = PluginNeighbours { prev: Some(PluginNeighbour { time: 1.25, pixels: &prev }), next: Some(PluginNeighbour { time: 2.75, pixels: &next }) };
+    let mut pixels = current.clone();
+    let mut frame = effectcraft_effects::plugin::PluginFrame { width: 2, height: 2, pixels: &mut pixels, scale: 1.0 };
+    plugin.render_with_neighbours(&mut frame, &params, 0.5, &neighbours).unwrap();
+    // Times and flags arrive as passed; the two buffers hold the real neighbouring pixels.
+    assert_eq!(pixels[0], [1.25, 2.75, 3.0, 1.0]);
+    assert_eq!(pixels[1], prev[1]);
+    assert_eq!(pixels[2], next[2]);
+    assert_eq!(pixels[3], current[3]);
+}
+
+#[test]
+fn api_v2_without_a_host_gets_zeroed_neighbours() {
+    let spec = load_wasm(module_v2(&neighbour_reporter_manifest("org.test.nb.none"), neighbour_reporter_body()).as_bytes(), "none.wat").unwrap();
+    let plugin = effectcraft_effects::plugin::plugin("org.test.nb.none").unwrap();
+    let params = effectcraft_effects::plugin::PluginParams { manifest: plugin.manifest(), flat: &[] };
+    let current = vec![[0.9, 0.8, 0.7, 1.0]; 4];
+    let mut pixels = current.clone();
+    let mut frame = effectcraft_effects::plugin::PluginFrame { width: 2, height: 2, pixels: &mut pixels, scale: 1.0 };
+    // `render` is the no-neighbour path (the Plug-in Library preview and a headless caller use
+    // it): both buffers are zeroed, both flags are clear, and the module still renders.
+    plugin.render(&mut frame, &params, 0.5).unwrap();
+    assert_eq!(pixels[0], [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(&pixels[1..], &current[1..]);
+    assert_eq!(spec.id, "org.test.nb.none");
+}
+
+#[test]
+fn api_v2_manifests_and_exports_must_agree() {
+    // A v1 module whose manifest says API 2 is refused.
+    let m2 = module_with(&neighbour_reporter_manifest("org.test.nb.v1module"), "");
+    let e = load_err(load_wasm(m2.as_bytes(), "mismatch.wat"));
+    assert!(e.contains("manifest declares API 2"), "{e}");
+    // A v2 module without `ec_render2` is refused (and says which export is missing).
+    let no_render = module_v2(&neighbour_reporter_manifest("org.test.nb.missing"), "").replace("(export \"ec_render2\")", "");
+    let e = load_err(load_wasm(no_render.as_bytes(), "missing.wat"));
+    assert!(e.contains("ec_render2"), "{e}");
+    // A v2 module with a matching manifest loads and reports API 2.
+    let spec = load_wasm(module_v2(&neighbour_reporter_manifest("org.test.nb.ok"), neighbour_reporter_body()).as_bytes(), "ok.wat").unwrap();
+    assert_eq!(spec.id, "org.test.nb.ok");
 }
 
 #[test]

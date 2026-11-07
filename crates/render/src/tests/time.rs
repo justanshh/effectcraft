@@ -1,7 +1,10 @@
 //! Time effects through the renderer: neighbouring frames via `EffectHost::self_at`, and the
 //! layer cache staying correct while scrubbing.
 
+use std::sync::Arc;
+
 use effectcraft_color::Label;
+use effectcraft_effects::plugin::{EffectPlugin, PluginFrame, PluginManifest, PluginNeighbours, PluginParams, register_plugin};
 use effectcraft_keyframe::{Keyframe, ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerSource, MaskMode, Project, Solid};
@@ -118,6 +121,100 @@ fn cache_correct_while_scrubbing() {
     for t in [0.3, 0.5, 0.8] {
         assert_eq!(render(&p, cid, t, Some(&cache)).data, render(&p, cid, t, None).data, "edited t={t}");
     }
+}
+
+/// An API 2 plug-in reads the layer's neighbouring frames, so its layer's cache key includes the
+/// layer time even when the source and every property are static. API 1 plug-ins keep the old
+/// key (#1977: a static layer stays cached across a scrub).
+#[test]
+fn api2_plugin_layers_key_on_layer_time() {
+    struct NeighbourReader {
+        m: PluginManifest,
+    }
+
+    impl EffectPlugin for NeighbourReader {
+        fn manifest(&self) -> &PluginManifest {
+            &self.m
+        }
+
+        fn render(&self, _frame: &mut PluginFrame, _params: &PluginParams, _time: f64) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn render_with_neighbours(
+            &self,
+            _frame: &mut PluginFrame,
+            _params: &PluginParams,
+            _time: f64,
+            _neighbours: &PluginNeighbours<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A static white solid with one plug-in effect of API `api`.
+    fn plugin_scene(api: u32) -> (Project, ItemId) {
+        let mut p = Project::default();
+        let comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 1.0, 1.0], width: 200, height: 100, pixel_aspect: 1.0 }));
+        let mut l = build::layer(&mut p, &comp, "Solid", LayerSource::Solid { item: sid }, (200, 100), None);
+        let m = PluginManifest {
+            api,
+            id: format!("org.test.render.time-key.{api}"),
+            name: format!("Key {api}"),
+            category: "Test Plug-ins".into(),
+            version: "1".into(),
+            author: String::new(),
+            description: String::new(),
+            params: vec![],
+        };
+        let spec = register_plugin(Arc::new(NeighbourReader { m })).unwrap();
+        let mut next = p.next_id;
+        let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [200.0, 100.0]);
+        p.next_id = next;
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l);
+        (p, cid)
+    }
+
+    fn key(p: &Project, cid: ItemId, t: f64) -> Option<u64> {
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx {
+            project: p,
+            comp_id: cid,
+            comp,
+            time: Tick::from_seconds_f64(t),
+            expr: None,
+            footage: None,
+            property_overrides: &[],
+            media_overrides: &[],
+        };
+        crate::cache::layer_key(&ctx, &comp.layers[0], 1.0, false, false)
+    }
+
+    let (v1, c1) = plugin_scene(1);
+    assert_eq!(key(&v1, c1, 0.25), key(&v1, c1, 0.5), "an API 1 layer keeps its old key");
+    let (v2, c2) = plugin_scene(2);
+    assert_ne!(key(&v2, c2, 0.25), key(&v2, c2, 0.5), "an API 2 layer keys on the layer time");
+    // The input *before* the plug-in does not read neighbours, so it stays time independent;
+    // the input after it (its output) does.
+    let input = |p: &Project, cid: ItemId, t: f64, effects: usize| {
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx {
+            project: p,
+            comp_id: cid,
+            comp,
+            time: Tick::from_seconds_f64(t),
+            expr: None,
+            footage: None,
+            property_overrides: &[],
+            media_overrides: &[],
+        };
+        crate::cache::input_key(&ctx, &comp.layers[0], 1.0, false, false, effects)
+    };
+    assert_eq!(input(&v2, c2, 0.25, 0), input(&v2, c2, 0.5, 0));
+    assert_ne!(input(&v2, c2, 0.25, 1), input(&v2, c2, 0.5, 1));
 }
 
 /// A layer's input up to an effect keys only the effects before it: editing a later effect (a

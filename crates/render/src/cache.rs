@@ -542,8 +542,31 @@ fn reads_other_times(layer: &Layer, effects: Option<usize>) -> bool {
             fx.groups().take(effects.unwrap_or(usize::MAX)).any(|g| {
                 g.enabled
                     && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect }
-                        if effect.starts_with("ec.time.") || effectcraft_effects::reads_param_history(effect))
+                        if effect.starts_with("ec.time.")
+                            || effectcraft_effects::reads_param_history(effect)
+                            || reads_neighbour_frames(effect))
             })
+        })
+}
+
+/// Does plug-in `id` declare plug-in API 2, so its output depends on the layer time (it reads
+/// the neighbouring frames)? API 2 modules are time dependent by definition, like built-in time
+/// effects; this puts the layer time in their cache key.
+fn reads_neighbour_frames(id: &str) -> bool {
+    effectcraft_effects::plugin::plugin(id).is_some_and(|p| p.manifest().api >= 2)
+}
+
+/// Does the effect stack reach a plug-in that reads neighbouring frames? `effects` bounds the
+/// stack the same way [`input_key`] does.
+fn plugin_reads_neighbours(layer: &Layer, effects: EffectScope) -> bool {
+    let limit = match effects {
+        EffectScope::Footprint => return false,
+        EffectScope::First(n) => n,
+        EffectScope::All => usize::MAX,
+    };
+    layer.switches.effects
+        && layer.effects().is_some_and(|fx| {
+            fx.groups().take(limit).any(|g| g.enabled && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if reads_neighbour_frames(effect)))
         })
 }
 
@@ -624,6 +647,11 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
     ctx.comp.frame_rate.as_f64().to_bits().hash(&mut h);
     ctx.comp.enable_frame_blending.hash(&mut h);
+    // An API 2 plug-in reads the layer's frames around this time, so its output changes with the
+    // layer time even on a still source. Key on it (v1 plug-ins keep the old key, #1977).
+    if plugin_reads_neighbours(layer, effects) {
+        ctx.time.0.hash(&mut h);
+    }
     dependencies::hash(&mut h, ctx, layer, effects)?;
     match &layer.source {
         LayerSource::Solid { item } => {

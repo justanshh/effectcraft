@@ -11,7 +11,7 @@ Guide):
 
 | After Effects | EffectCraft | |
 |---|---|---|
-| Effect plug-ins (C/C++ SDK, `.aex` / `.plugin`) | [Effect plug-ins](#effect-plug-ins): WebAssembly modules (plug-in API v1) or Rust; the `Plug-ins` folder next to the settings loads at start-up | Different ABI: After Effects SDK plug-ins can't run (G8) |
+| Effect plug-ins (C/C++ SDK, `.aex` / `.plugin`) | [Effect plug-ins](#effect-plug-ins): WebAssembly modules (plug-in API v1 and v2) or Rust; the `Plug-ins` folder next to the settings loads at start-up | Different ABI: After Effects SDK plug-ins can't run (G8) |
 | Scripts folder: its scripts are listed in File ▸ Scripts | `Scripts/` in the settings folder (File ▸ Scripts ▸ Install Script File… copies a script there), listed in File ▸ Scripts with the bundled samples; a subfolder (one level) is a submenu named after it | Same |
 | File ▸ Scripts ▸ Run Script File… (`.jsx`, `.jsxbin`) | `.jsx` / `.js` | Gap: `.jsxbin` (an undocumented binary encoding) |
 | File ▸ Scripts ▸ Recent Script Files: the 10 most recently run scripts; Cmd+Option+Shift+D (Ctrl+Alt+Shift+D on Windows) reruns one | File ▸ Scripts ▸ Recent Script Files lists the 10 scripts run last (script files and File ▸ Scripts entries, newest first, kept in the settings); Cmd+Alt+Shift+D runs the most recent one again (`file.runScript {"recent": 0}`, a key that can be changed in Edit ▸ Keyboard Shortcuts) | Same |
@@ -152,7 +152,7 @@ example of a keyframe tool.
 
 ## Effect plug-ins
 
-EffectCraft loads third-party effects through a small, versioned plug-in API (**API version 1**).
+EffectCraft loads third-party effects through a small, versioned plug-in API (**API versions 1 and 2**).
 A plug-in effect behaves exactly like a built-in one: it is listed in Effects & Presets (and the
 Effect menu) under its category, applied by id (`effect.apply {"effect": "org.example.posterize"}`)
 or display name, its parameters are ordinary properties (keyframes, expressions, Effect Controls,
@@ -178,7 +178,8 @@ author, source, params}]}`.
 * **Parameters** arrive flattened to `f64`s in the order they are declared: slider, angle,
   checkbox (0 / 1) and popup (0-based index) take one value, point two (already in **buffer
   pixels**), colour four (RGBA 0–1).
-* **Time** is layer time in seconds.
+* **Time** is layer time in seconds. A plug-in written for API 2 also gets the layer's
+  neighbouring frames at other times (see [WebAssembly ABI](#webassembly-abi)).
 * Rendering must be **deterministic** and may run on several threads at once (a WebAssembly
   plug-in gets one instance per thread).
 * A failed render (an error code, a trap, running out of fuel) leaves the frame unchanged.
@@ -205,33 +206,58 @@ Every plug-in describes itself with a JSON manifest:
 }
 ```
 
+* `api`: the plug-in API the effect is written for: `1` (the original ABI) or `2` (adds the
+  neighbouring frames, see below). It must match the module's `ec_api_version`. This build
+  implements both versions; a version it does not implement is refused with a message.
 * `id`: stable, reverse-domain; letters, digits, `.`, `_`, `-`. `ec.` is reserved for built-ins.
   Ids must be unique (a second plug-in with a taken id is refused).
 * `category`: one of the Effects & Presets categories (`Blur & Sharpen`, `Stylize`, …) or a new
   one, which appears after the built-in categories.
 * Parameter types: `slider` (`default`, `min`, `max`, optional `sliderMin`, `sliderMax`,
-  `decimals`), `angle` (`default` degrees), `checkbox` (`default` bool), `popup` (`options`,
-  `default` index), `point` (`default` as fractions of the layer size, `[0.5, 0.5]` = centre),
-  `color` (`default` RGBA 0–1). Parameter ids are letters, digits and `_`, unique; at most 256
-  parameters; a slider needs `min ≤ default ≤ max` (and `sliderMin ≤ sliderMax`); the manifest
-  is at most 1 MiB.
+  round to `decimals`), `angle` (`default` degrees), `checkbox` (`default` bool), `popup`
+  (`options`, `default` index), `point` (`default` as fractions of the layer size,
+  `[0.5, 0.5]` = centre), `color` (`default` RGBA 0–1). Parameter ids are letters, digits and
+  `_`, unique; at most 256 parameters; a slider needs `min ≤ default ≤ max` (and
+  `sliderMin ≤ sliderMax`); the manifest is at most 1 MiB.
+* **Grouped UI** (twirl-downs): a parameter id may carry a group path — `Main/radius` nests
+  Radius in a **Main** twirl-down, `Style/Gamma/sceneGamma` two levels deep. Paths cost
+  nothing in the flat render array, which stays one `f64` per parameter, four per colour;
+  group display names come from the host table (`uiMain` → *Main*, …) or the raw last
+  path segment.
 
-### WebAssembly ABI (v1)
+### WebAssembly ABI
 
-A module with **no imports** that exports:
+A module has **no imports**. Its `ec_api_version` must equal its manifest's `api`, and it exports:
 
 | export | signature | |
 |---|---|---|
 | `memory` | memory | linear memory shared with the host |
-| `ec_api_version` | `() -> i32` | must return `1` |
+| `ec_api_version` | `() -> i32` | `1` for `ec_render`, `2` for `ec_render2` |
 | `ec_manifest_ptr`, `ec_manifest_len` | `() -> i32` | the UTF-8 JSON manifest in memory |
 | `ec_alloc` | `(bytes: i32) -> i32` | a buffer of at least `bytes` bytes, 8-byte aligned; it may reuse the previous one |
-| `ec_render` | `(pixels: i32, width: i32, height: i32, params: i32, nparams: i32, time: f64, scale: f64) -> i32` | process the pixels in place; return 0 on success |
+| `ec_render` (API 1) | `(pixels: i32, width: i32, height: i32, params: i32, nparams: i32, time: f64, scale: f64) -> i32` | process the pixels in place; return 0 on success |
+| `ec_render2` (API 2) | `ec_render`'s arguments, then `prev: i32, prev_time: f64, next: i32, next_time: f64, flags: i32` | the same, with the neighbouring frames; return 0 on success |
 
 For each frame the host calls `ec_alloc` once for a buffer holding the parameters (`nparams`
-little-endian `f64`s) followed by the pixels (`width × height × 4` little-endian `f32`s), fills it,
-calls `ec_render`, and reads the pixels back. Each call gets a fuel budget proportional to the
-frame size; a module that loops forever stops with an error instead of hanging the app.
+little-endian `f64`s) followed by the pixels (`width × height × 4` little-endian `f32`s,
+premultiplied RGBA, row-major), fills it, calls the render export, and reads the pixels back. An
+API 2 module gets the previous and next frames after the current one, on the same grid, and
+`ec_render2` receives a pointer to each:
+
+* The neighbours are the plug-in's own layer at other layer times: the layer's source, its masks
+  and the effects **below** this plug-in, resampled onto the current buffer's grid. They come from
+  the same host service the built-in time effects use, so they are a pure function of the project
+  and read no files or clock.
+* At a frame boundary they are the frames before and after it (`time ± 1/fps`); between frames
+  they are the two frames that bracket `time`.
+* `flags` bit 0 is set when `prev` holds a real frame, bit 1 when `next` does. The other buffer is
+  still allocated but zeroed, so a plug-in may read both without a null check. `prev_time` /
+  `next_time` are those frames' layer times in seconds (0 when absent).
+
+Each call gets a fuel budget proportional to the frame size; a module that loops forever stops
+with an error instead of hanging the app. Because an API 2 plug-in reads other times, its layer is
+keyed on the layer time in the render cache; an API 1 plug-in keeps the time-independent key
+(#1977).
 
 #### Example
 
@@ -269,10 +295,10 @@ folder the app runs at every start, so:
 * Files over 64 MiB are refused before they are read, rather than copied into a startup folder.
 * A `.wasm` is loaded once, in the same sandbox it runs in later (see below), so a module that
   cannot load is reported instead of failing every start. That load runs the module's start-up
-  code and its metadata exports; `ec_render` is never called, and a panel's script is not run at
-  install time (it runs when the panel opens, as with any installed panel). The copy made before
-  the load is then removed again — best effort: if removing it fails, the command says so and
-  names the file, and you delete it from `Plug-ins` yourself.
+  code and its metadata exports; the render export is never called, and a panel's script is not
+  run at install time (it runs when the panel opens, as with any installed panel). The copy made
+  before the load is then removed again — best effort: if removing it fails, the command says so
+  and names the file, and you delete it from `Plug-ins` yourself.
 * A `.wasm` is uninstalled by deleting it from `Plug-ins` (the next start no longer loads it):
   there is no `effect.plugins.uninstall`. A panel installed here is an installed script, so
   `file.uninstallScript {name}` removes it. Replacing either means removing it first.
@@ -321,10 +347,17 @@ register_plugin(Arc::new(Swap(manifest)))?; // before the UI builds its menus
 `PluginParams` reads values by parameter id (`f`, `b`, `point`, `color`). At most 256 plug-in
 effects can be registered per process.
 
+A Rust plug-in can read neighbouring frames too: declare `api: 2` in its manifest and implement
+`render_with_neighbours`, which receives the same frame and parameters plus a `PluginNeighbours`
+with `prev` / `next` (each carrying the layer time and pixels). The default implementation
+ignores them and calls `render`, so API 1 plug-ins need no change.
+
 ### Compatibility
 
-The API version is checked when a plug-in loads: a manifest or module for another version is
-refused with a message. Within a version the contract above does not change; additions (new
+The API version is checked when a plug-in loads: this build implements API 1 and 2, and a version
+it does not implement is refused with a message (as is a module whose `ec_api_version` disagrees
+with its manifest). API 1 modules load and render unchanged; API 2 adds `ec_render2` and the
+neighbouring frames. Within a version the contract above does not change; additions (new
 parameter types, new optional exports) bump the version.
 
 ## Plug-in Library

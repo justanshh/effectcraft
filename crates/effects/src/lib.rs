@@ -982,6 +982,19 @@ pub const PARAM_GROUPS: &[(&str, &str)] = &[
     ("highQualitySettings", "High Quality Settings"),
     ("edgeOptions", "Edge Options"),
     ("strokeOptions", "Stroke Options"),
+    // GlowCraft plug-in twirl-downs (`ui*` param ids nest via path segments).
+    ("uiMain", "Main"),
+    ("uiInput", "Input"),
+    ("uiStyle", "Style"),
+    ("uiGamma", "Gamma Correction"),
+    ("uiAspect", "Aspect Ratio"),
+    ("uiAberration", "Chromatic Aberration"),
+    ("uiChannels", "Glow Channels"),
+    ("uiTint", "Tint"),
+    ("uiToneMap", "Tone Mapping"),
+    ("uiDirt", "Lens Dirt"),
+    ("uiQuality", "Quality"),
+    ("uiOutput", "Output"),
 ];
 
 /// Display names of nested parameter groups by match id.

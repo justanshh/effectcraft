@@ -1,20 +1,23 @@
 //! # effectcraft-plugin (L3)
 //!
-//! Loads **WebAssembly effect plug-ins** (plug-in API v1, see `docs/plugins.md`) into the effect
-//! registry ([`effectcraft_effects::plugin`]). A plug-in is a `.wasm` (or `.wat`) module with
-//! no imports that exports:
+//! Loads **WebAssembly effect plug-ins** (plug-in API v1 and v2, see `docs/plugins.md`) into the
+//! effect registry ([`effectcraft_effects::plugin`]). A plug-in is a `.wasm` (or `.wat`) module
+//! with no imports that exports:
 //!
 //! | export | signature | |
 //! |---|---|---|
 //! | `memory` | memory | linear memory shared with the host |
-//! | `ec_api_version` | `() -> i32` | must return 1 |
+//! | `ec_api_version` | `() -> i32` | 1 for `ec_render`, 2 for `ec_render2`; it must match the manifest's `api` |
 //! | `ec_manifest_ptr`, `ec_manifest_len` | `() -> i32` | a UTF-8 JSON [`PluginManifest`] in memory |
 //! | `ec_alloc` | `(bytes: i32) -> i32` | a buffer of at least `bytes` bytes, 8-byte aligned; it may reuse the previous one |
-//! | `ec_render` | `(pixels: i32, width: i32, height: i32, params: i32, nparams: i32, time: f64, scale: f64) -> i32` | process the pixels in place; 0 = ok |
+//! | `ec_render` | `(pixels: i32, width: i32, height: i32, params: i32, nparams: i32, time: f64, scale: f64) -> i32` | API 1: process the pixels in place; 0 = ok |
+//! | `ec_render2` | `ec_render`'s arguments, then `prev: i32, prev_time: f64, next: i32, next_time: f64, flags: i32` | API 2: the same, with the neighbouring frames; 0 = ok |
 //!
 //! For each render the host asks `ec_alloc` for one buffer holding the parameters (`nparams`
 //! little-endian `f64`s) followed by the pixels (`width × height × 4` little-endian `f32`s,
-//! premultiplied RGBA, row-major), calls `ec_render`, and reads the pixels back.
+//! premultiplied RGBA, row-major), calls the render export, and reads the pixels back. API 2
+//! allocates the two neighbour frames after the pixels; `flags` bit 0 / bit 1 say whether `prev`
+//! / `next` hold a real frame, and an absent neighbour's buffer is zeroed.
 //!
 //! Modules run in the [wasmi](https://github.com/wasmi-labs/wasmi) interpreter (pure Rust,
 //! MIT/Apache-2.0) with deterministic floats, no imports (no files, network or clock) and a
@@ -25,7 +28,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use effectcraft_effects::EffectSpec;
-pub use effectcraft_effects::plugin::{EffectPlugin, PLUGIN_API_VERSION, PluginFrame, PluginManifest, PluginParams, register_plugin};
+pub use effectcraft_effects::plugin::{
+    EffectPlugin, MIN_PLUGIN_API_VERSION, PLUGIN_API_VERSION, PluginFrame, PluginManifest, PluginNeighbour, PluginNeighbours, PluginParams, register_plugin,
+    supports_api,
+};
 
 #[cfg(feature = "wasm")]
 mod wasm;
@@ -59,7 +65,7 @@ pub fn loader(bytes: &[u8], source: &str) -> Result<serde_json::Value, String> {
         "name": spec.name,
         "category": spec.category,
         "version": m.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
-        "api": PLUGIN_API_VERSION,
+        "api": m.as_ref().map_or(PLUGIN_API_VERSION, |m| m.api),
         "params": spec.params.len(),
     }))
 }

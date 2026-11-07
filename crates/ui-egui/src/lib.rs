@@ -18,6 +18,10 @@ pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
     ..craft_update::suite::EFFECTCRAFT
 };
 
+/// The product name this build shows: the window title and the About dialog. Settings, projects
+/// and plug-ins keep the EffectCraft locations, so existing installs carry over.
+pub const PRODUCT_NAME: &str = "effectcraft test";
+
 pub mod audio;
 pub mod automation;
 pub mod bench;
