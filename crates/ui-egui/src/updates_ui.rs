@@ -24,7 +24,8 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
-            updater: Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")),
+            updater: Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION"))
+                .with_source(std::sync::Arc::new(|| Err("Update checks are disabled in this build: an upstream EffectCraft release would replace it.".into()))),
             #[cfg(not(target_arch = "wasm32"))]
             startup_check: false,
             #[cfg(not(target_arch = "wasm32"))]

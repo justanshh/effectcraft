@@ -342,7 +342,7 @@ fn about(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut cmd: Option<&str> = None;
     let tab_id = egui::Id::unique("about_tab");
     // Wide enough for every Contributors column at its natural width (modals shrink to the window).
-    modal(ctx, "About EffectCraft", vec2(820.0, 520.0), t, |ui| {
+    modal(ctx, &format!("About {}", crate::PRODUCT_NAME), vec2(820.0, 520.0), t, |ui| {
         let mut tab = ui.data_mut(|d| d.get_temp::<usize>(tab_id)).unwrap_or(0);
         ui.horizontal(|ui| {
             for (i, (label, id)) in ABOUT_TABS.iter().enumerate() {
@@ -395,7 +395,7 @@ fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut
     let p = ui.painter();
     p.rect_filled(r, 10.0, Color32::from_rgb(0x1b, 0x22, 0x3c));
     crate::header::paint_logo(p, Rect::from_min_size(r.min + vec2(18.0, 20.0), vec2(56.0, 56.0)));
-    p.text(r.min + vec2(90.0, 34.0), Align2::LEFT_CENTER, "EffectCraft", Tokens::semibold(24.0), Color32::WHITE);
+    p.text(r.min + vec2(90.0, 34.0), Align2::LEFT_CENTER, crate::PRODUCT_NAME, Tokens::semibold(24.0), Color32::WHITE);
     p.text(
         r.min + vec2(90.0, 62.0),
         Align2::LEFT_CENTER,

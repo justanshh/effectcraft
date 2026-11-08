@@ -1042,6 +1042,19 @@ pub const PARAM_GROUPS: &[(&str, &str)] = &[
     ("highQualitySettings", "High Quality Settings"),
     ("edgeOptions", "Edge Options"),
     ("strokeOptions", "Stroke Options"),
+    // GlowCraft plug-in twirl-downs (`ui*` param ids nest via path segments).
+    ("uiMain", "Main"),
+    ("uiInput", "Input"),
+    ("uiStyle", "Style"),
+    ("uiGamma", "Gamma Correction"),
+    ("uiAspect", "Aspect Ratio"),
+    ("uiAberration", "Chromatic Aberration"),
+    ("uiChannels", "Glow Channels"),
+    ("uiTint", "Tint"),
+    ("uiToneMap", "Tone Mapping"),
+    ("uiDirt", "Lens Dirt"),
+    ("uiQuality", "Quality"),
+    ("uiOutput", "Output"),
 ];
 
 /// Display names of nested parameter groups by match id.
@@ -1436,7 +1449,7 @@ pub const TIME_DEPENDENT: &[&str] = &[
 pub fn is_time_dependent(id: &str) -> bool {
     // Simulations replay from layer time 0, so every frame differs even when the defaults
     // happen to look static at the test's two sample times.
-    id.starts_with("ec.sim.") || TIME_DEPENDENT.contains(&id)
+    id.starts_with("ec.sim.") || TIME_DEPENDENT.contains(&id) || (!id.starts_with("ec.") && plugin::reads_other_times(id))
 }
 
 /// Does effect `id` read its own parameters at earlier times (the stepped particle systems sample

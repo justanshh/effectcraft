@@ -86,10 +86,11 @@ pub fn project_name(app: &EffectcraftApp) -> String {
         .unwrap_or_else(|| "Untitled Project.ecproj".into())
 }
 
-/// The window title: the project's path (or name) and `*` while it has unsaved changes.
+/// The window title: the product name, the project's path (or name) and `*` while it has unsaved
+/// changes.
 pub fn window_title(app: &EffectcraftApp) -> String {
     let doc = app.session.path.clone().unwrap_or_else(|| project_name(app));
-    format!("EffectCraft - {doc}{}", if app.session.is_dirty() { " *" } else { "" })
+    format!("{} - {doc}{}", crate::PRODUCT_NAME, if app.session.is_dirty() { " *" } else { "" })
 }
 
 /// Whether the prompt is Revert Project (Revert / Cancel) instead of Unsaved Changes.
