@@ -699,6 +699,94 @@ fn source_at_caps_a_render_at_64_calls() {
     assert_eq!(px[0][0], 64.0, "64 calls succeed, call 65 is refused: {px:?}");
 }
 
+/// An ABI 2 module that imports `ec.param_at`, reads its own `speed` parameter at layer time
+/// 2.5 and writes the value into red. Its manifest declares the import.
+fn param_at_module(id: &str) -> String {
+    let manifest = format!(
+        r#"{{"api":2,"id":"{id}","name":"ParamAt {id}","category":"Test Plug-ins","version":"1","imports":["param_at"],"params":[]}}"#
+    );
+    param_at_module_with(&manifest)
+}
+
+/// The same module with a caller-supplied manifest (so a test can omit or change `imports`).
+fn param_at_module_with(manifest: &str) -> String {
+    let len = manifest.len();
+    let escaped = manifest.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"(module
+  (import "ec" "param_at" (func $param_at (param i32 i32 f64) (result f64)))
+  (memory (export "memory") 2)
+  (data (i32.const 16) "{escaped}")
+  (data (i32.const 512) "speed")
+  (func (export "ec_api_version") (result i32) i32.const 2)
+  (func (export "ec_manifest_ptr") (result i32) i32.const 16)
+  (func (export "ec_manifest_len") (result i32) i32.const {len})
+  (func (export "ec_alloc") (param i32) (result i32) i32.const 1024)
+  (func (export "ec_render2")
+    (param $px i32) (param $w i32) (param $h i32) (param $params i32) (param $np i32)
+    (param $t f64) (param $scale f64)
+    (param $prev i32) (param $prev_t f64) (param $next i32) (param $next_t f64) (param $flags i32)
+    (result i32)
+    local.get $px
+    i32.const 512
+    i32.const 5
+    f64.const 2.5
+    call $param_at
+    f32.demote_f64
+    f32.store
+    i32.const 0))"#
+    )
+}
+
+/// A host that answers `param_at` for `speed`: 10 × the requested layer time.
+struct ParamAtHost;
+
+impl effectcraft_effects::plugin::PluginHost for ParamAtHost {
+    fn input_at(&self, _layer_time: f64) -> Option<effectcraft_effects::plugin::PluginImage> {
+        None
+    }
+
+    fn layer_input(&self, _param_id: &str, _layer_time: f64) -> Option<effectcraft_effects::plugin::PluginImage> {
+        None
+    }
+
+    fn params_at(&self, _layer_time: f64) -> Option<(Vec<f64>, Vec<String>)> {
+        None
+    }
+
+    fn param_at(&self, id: &str, layer_time: f64) -> Option<f64> {
+        (id == "speed").then_some(layer_time * 10.0)
+    }
+
+    fn frame_rate(&self) -> f64 {
+        4.0
+    }
+
+    fn time(&self) -> f64 {
+        0.5
+    }
+}
+
+#[test]
+fn abi_v2_param_at_reads_own_parameters_at_another_time() {
+    load_wasm(param_at_module("org.test.paramat").as_bytes(), "paramat.wat").unwrap();
+    let p = effectcraft_effects::plugin::plugin("org.test.paramat").unwrap();
+    let params = effectcraft_effects::plugin::PluginParams { manifest: p.manifest(), flat: &[], texts: &[] };
+    let mut px = vec![[0.0f32; 4]; 2];
+    let host = ParamAtHost;
+    let mut frame = effectcraft_effects::plugin::PluginFrame { width: 2, height: 1, pixels: &mut px, scale: 1.0, origin: [0.0; 2], layer_size: [2.0, 1.0] };
+    p.render_v2(&mut frame, &params, 0.5, &host).unwrap();
+    assert!((px[0][0] - 25.0).abs() < 1e-6, "param_at(speed, 2.5) = 25: {px:?}");
+}
+
+#[test]
+fn param_at_must_be_declared() {
+    let undeclared = param_at_module_with(
+        r#"{"api":2,"id":"org.test.paramat.undeclared","name":"ParamAt","category":"Test Plug-ins","version":"1","params":[]}"#,
+    );
+    assert!(load_err(load_wasm(undeclared.as_bytes(), "paramat-undeclared.wat")).contains("does not list it"));
+}
+
 #[test]
 fn source_at_must_be_declared_and_needs_abi_2() {
     // The module imports source_at but the manifest does not declare it.

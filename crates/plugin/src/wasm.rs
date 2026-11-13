@@ -8,9 +8,11 @@ use crate::{EffectPlugin, MIN_WASM_API_VERSION, PluginFrame, PluginManifest, Plu
 use effectcraft_effects::plugin::{PluginHost, PluginImage};
 
 /// Instruction budget per frame: a fixed allowance plus some per pixel. Generous for per-pixel
-/// work, but a runaway loop stops instead of hanging the render.
-const FUEL_BASE: u64 = 50_000_000;
-const FUEL_PER_PIXEL: u64 = 20_000;
+/// work, but a runaway loop stops instead of hanging the render. Retiming plug-ins estimate motion
+/// at several scales on top of per-pixel work, so the allowance is large enough for a full 4K
+/// frame at the heaviest quality instead of trapping mid-render.
+const FUEL_BASE: u64 = 200_000_000;
+const FUEL_PER_PIXEL: u64 = 80_000;
 /// The most `source_at` calls one render may make. Each call renders another frame, so a
 /// runaway effect stops instead of multiplying the render cost without bound.
 const MAX_SOURCE_AT_CALLS: u32 = 64;
@@ -29,6 +31,42 @@ struct SourceAtStore<'a> {
     origin: [f64; 2],
     scale: f64,
     calls: u32,
+}
+
+/// `ec.param_at(id_ptr, id_len, layer_time) -> f64`. Reads a parameter id from the module's
+/// memory and returns this effect's value at another **layer time**, or NaN when unavailable.
+/// Mirrors [`PluginHost::param_at`], which native effects use to integrate a keyframed Speed.
+fn param_at_host<'a>(caller: Caller<'_, SourceAtStore<'a>>, id_ptr: i32, id_len: i32, layer_time: f64) -> f64 {
+    if !layer_time.is_finite() || id_ptr < 0 || id_len <= 0 || id_len > 256 {
+        return f64::NAN;
+    }
+    let host = caller.data().host;
+    let Some(memory) = caller.get_export("memory").and_then(|e| match e {
+        Extern::Memory(m) => Some(m),
+        _ => None,
+    }) else {
+        return f64::NAN;
+    };
+    let start = id_ptr as usize;
+    let Some(end) = start.checked_add(id_len as usize) else {
+        return f64::NAN;
+    };
+    if end > memory.data_size(&caller) {
+        return f64::NAN;
+    }
+    let mut buf = vec![0u8; id_len as usize];
+    if memory.read(&caller, start, &mut buf).is_err() {
+        return f64::NAN;
+    }
+    let Ok(id) = std::str::from_utf8(&buf) else {
+        return f64::NAN;
+    };
+    host.param_at(id, layer_time).unwrap_or(f64::NAN)
+}
+
+/// `ec.param_at` at load time: no render host, so every call is unavailable.
+fn param_at_host_unavailable(_: Caller<'_, StoreLimits>, _: i32, _: i32, _: f64) -> f64 {
+    f64::NAN
 }
 
 /// `ec.source_at(layer_time, effects, dst_ptr, dst_len) -> 0 ok, 1 unavailable, 2 bad buffer`.
@@ -170,14 +208,17 @@ fn finish_begin<T>(mut store: Store<T>, linker: Linker<T>, module: &Module) -> R
 }
 
 /// Instantiate `module` in a fresh, limited store and read its memory and allocator.
-/// `source_at` only resolves the import so the manifest can be read; such call returns 1,
-/// because the real host arrives with [`instantiate_source_at`] at render time.
-fn begin(engine: &Engine, module: &Module, source_at: bool) -> Result<Pending<StoreLimits>, String> {
+/// `source_at` and `param_at` only resolve their imports so the manifest can be read; such calls
+/// return unavailable, because the real host arrives with [`instantiate_source_at`] at render time.
+fn begin(engine: &Engine, module: &Module, source_at: bool, param_at: bool) -> Result<Pending<StoreLimits>, String> {
     let mut store = Store::new(engine, StoreLimitsBuilder::new().memory_size(MAX_MEMORY).instances(1).build());
     store.limiter(|l| l);
     let mut linker = Linker::<StoreLimits>::new(engine);
     if source_at {
         linker.func_wrap("ec", "source_at", source_at_host_unavailable).map_err(err)?;
+    }
+    if param_at {
+        linker.func_wrap("ec", "param_at", param_at_host_unavailable).map_err(err)?;
     }
     finish_begin(store, linker, module)
 }
@@ -192,19 +233,26 @@ fn instantiate_source_at<'a>(
     height: u32,
     origin: [f64; 2],
     scale: f64,
+    param_at: bool,
 ) -> Result<Inst<SourceAtStore<'a>>, String> {
     let limits = StoreLimitsBuilder::new().memory_size(MAX_MEMORY).instances(1).build();
-    let mut store = Store::new(engine, SourceAtStore { limits, host, width, height, origin, scale, calls: 0 });
+    let mut store = Store::new(
+        engine,
+        SourceAtStore { limits, host, width, height, origin, scale, calls: 0 },
+    );
     store.limiter(|s| &mut s.limits);
     let mut linker = Linker::<SourceAtStore<'a>>::new(engine);
     linker.func_wrap("ec", "source_at", source_at_host).map_err(err)?;
+    if param_at {
+        linker.func_wrap("ec", "param_at", param_at_host).map_err(err)?;
+    }
     finish_begin(store, linker, module)?.finish(2)
 }
 
-/// Instantiate `module` and select the render export for `abi`. A `source_at` module gets the
-/// unavailable import here: this path has no render host, so its calls return 1.
-fn instantiate(engine: &Engine, module: &Module, abi: u32, source_at: bool) -> Result<Inst<StoreLimits>, String> {
-    begin(engine, module, source_at)?.finish(abi)
+/// Instantiate `module` and select the render export for `abi`. Modules that import the live
+/// host calls get the unavailable stubs here: this path has no render host.
+fn instantiate(engine: &Engine, module: &Module, abi: u32, source_at: bool, param_at: bool) -> Result<Inst<StoreLimits>, String> {
+    begin(engine, module, source_at, param_at)?.finish(abi)
 }
 
 /// A loaded WebAssembly effect plug-in.
@@ -215,6 +263,8 @@ pub struct WasmPlugin {
     abi: u32,
     /// The module imports `ec.source_at` (and its manifest declares it).
     source_at: bool,
+    /// The module imports `ec.param_at` (and its manifest declares it).
+    param_at: bool,
     engine: Engine,
     module: Module,
     /// Idle instances.
@@ -229,17 +279,27 @@ impl WasmPlugin {
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|e| format!("not a valid WebAssembly module: {e}"))?;
         let mut has_source_at = false;
+        let mut has_param_at = false;
         for i in module.imports() {
             if i.module() == "ec" && i.name() == "source_at" {
                 if has_source_at {
                     return Err("the module imports `ec.source_at` more than once".into());
                 }
                 has_source_at = true;
+            } else if i.module() == "ec" && i.name() == "param_at" {
+                if has_param_at {
+                    return Err("the module imports `ec.param_at` more than once".into());
+                }
+                has_param_at = true;
             } else {
-                return Err(format!("plug-ins can only import `ec.source_at` (the module imports `{}.{}`)", i.module(), i.name()));
+                return Err(format!(
+                    "plug-ins can only import `ec.source_at` and `ec.param_at` (the module imports `{}.{}`)",
+                    i.module(),
+                    i.name()
+                ));
             }
         }
-        let mut pending = begin(&engine, &module, has_source_at)?;
+        let mut pending = begin(&engine, &module, has_source_at, has_param_at)?;
         let version = pending.func::<(), i32>("ec_api_version")?;
         let abi = abi_of(version.call(&mut pending.store, ()).map_err(err)?)?;
         let ptr = pending.func::<(), i32>("ec_manifest_ptr")?.call(&mut pending.store, ()).map_err(err)?;
@@ -262,11 +322,28 @@ impl WasmPlugin {
                 "the module imports `ec.source_at` but the manifest does not list it in `imports`".into()
             });
         }
-        if has_source_at && abi < 2 {
-            return Err("`source_at` needs WebAssembly ABI 2 (the module reports ABI 1)".into());
+        let declared_param = manifest.imports.iter().any(|i| i == "param_at");
+        if declared_param != has_param_at {
+            return Err(if declared_param {
+                "the manifest declares `param_at` but the module does not import `ec.param_at`".into()
+            } else {
+                "the module imports `ec.param_at` but the manifest does not list it in `imports`".into()
+            });
+        }
+        if (has_source_at || has_param_at) && abi < 2 {
+            return Err("`source_at`/`param_at` needs WebAssembly ABI 2 (the module reports ABI 1)".into());
         }
         let inst = pending.finish(abi)?;
-        Ok(WasmPlugin { manifest, source: source.to_string(), abi, source_at: has_source_at, engine, module, pool: Mutex::new(vec![inst]) })
+        Ok(WasmPlugin {
+            manifest,
+            source: source.to_string(),
+            abi,
+            source_at: has_source_at,
+            param_at: has_param_at,
+            engine,
+            module,
+            pool: Mutex::new(vec![inst]),
+        })
     }
 
     /// An idle instance, or a fresh one when the pool is empty. `source_at` plug-ins do not use
@@ -275,7 +352,7 @@ impl WasmPlugin {
         if let Some(i) = self.pool.lock().ok().and_then(|mut p| p.pop()) {
             return Ok(i);
         }
-        instantiate(&self.engine, &self.module, self.abi, self.source_at)
+        instantiate(&self.engine, &self.module, self.abi, self.source_at, self.param_at)
     }
 
     /// Return a working instance to the pool.
@@ -481,9 +558,18 @@ impl EffectPlugin for WasmPlugin {
         let next = host.input_at(next_time);
         let prev = prev.as_ref().map(|img| (prev_time, img));
         let next = next.as_ref().map(|img| (next_time, img));
-        if self.source_at {
+        if self.source_at || self.param_at {
             // The store borrows `host`, so this instance serves exactly one render.
-            let mut inst = instantiate_source_at(&self.engine, &self.module, host, frame.width, frame.height, frame.origin, frame.scale)?;
+            let mut inst = instantiate_source_at(
+                &self.engine,
+                &self.module,
+                host,
+                frame.width,
+                frame.height,
+                frame.origin,
+                frame.scale,
+                self.param_at,
+            )?;
             render_v2_inst(&mut inst, frame, params, time, prev, next)
         } else {
             self.render_v2_buffers(frame, params, time, prev, next)

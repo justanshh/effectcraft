@@ -216,8 +216,11 @@ impl PluginManifest {
         }
         let mut seen_imports = std::collections::HashSet::new();
         for name in &self.imports {
-            if name != "source_at" {
-                return Err(format!("plug-in `{}`: unknown import `{name}` (only `source_at` is allowed)", self.id));
+            if name != "source_at" && name != "param_at" {
+                return Err(format!(
+                    "plug-in `{}`: unknown import `{name}` (only `source_at` and `param_at` are allowed)",
+                    self.id
+                ));
             }
             if !seen_imports.insert(name.as_str()) {
                 return Err(format!("plug-in `{}`: duplicate import `{name}`", self.id));
@@ -336,6 +339,12 @@ pub trait PluginHost {
     /// state between frames pool their native instances by it. 0 when unknown.
     fn instance_key(&self) -> u64 {
         0
+    }
+    /// This effect's own parameter `id` at another **layer time**, or `None`. Native effects have
+    /// the same call on [`EffectHost`](crate::EffectHost); it lets a plug-in integrate a keyframed
+    /// Speed so a speed ramp plays on instead of jumping to `time × speed`.
+    fn param_at(&self, _id: &str, _layer_time: f64) -> Option<f64> {
+        None
     }
     /// The layer's source time range in **layer time** seconds as (first, end): the first source
     /// frame starts at `first` and the source ends at `end` (see [`crate::EffectEnv::layer_span`]).
@@ -703,6 +712,11 @@ impl PluginHost for RenderHost<'_, '_> {
     fn params_at(&self, layer_time: f64) -> Option<(Vec<f64>, Vec<String>)> {
         let p = self.ctx.env.host?.params_at(layer_time)?;
         Some((flatten_params(self.manifest, &p, self.offset, self.scale), flatten_texts(self.manifest, &p)))
+    }
+
+    fn param_at(&self, id: &str, layer_time: f64) -> Option<f64> {
+        let host = self.ctx.env.host?;
+        host.param_at(self.ctx.env.effect_index, id, layer_time).map(|v| v.as_f64())
     }
 
     fn frame_rate(&self) -> f64 {
